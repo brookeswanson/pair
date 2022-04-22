@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+# coding: utf-8
+require "json"
+require "shellwords"
+
+PAIR_FILE = File.join(
+  ENV["HOME"], ".pair-state.json"
+).freeze
+
+# The name of a temporary file that contains the message. You change
+# the commit message by altering this file in-place.
+COMMIT_MESSAGE_FILE_NAME = ARGV[0].freeze
+
+# The type of commit. This one of
+#  * message (-m or -F option),
+#  * template (-t option),
+#  * merge (if the commit is a merge commits), or
+#  * squash (if the commit is squashing other commits).
+COMMIT_SOURCE = ARGV[1].freeze
+
+# The SHA1 hash of the relevant commit. Only given if -c, -C, or
+# --amend option was given.
+COMMIT_SHA1 = ARGV[2].freeze
+
+def main(file_name, source, sha1)
+  case source
+  when "merge", "squash"
+    exit
+  else
+    if File.exists?(PAIR_FILE)
+      pairs_json = File.open(PAIR_FILE, "r") do |pair_file|
+        JSON.parse(pair_file.read)
+      end
+
+      co_authors = pairs_json["co_authors"]
+      git_args = (["--trailer"] * co_authors.count).zip(co_authors).flatten
+      git_command = ["git", "interpret-trailers", *git_args, file_name].shelljoin
+
+      IO.popen(git_command) do |io|
+        # Get the content of the prepared message as it arrives on
+        # STDOUT. Then write it directly back to the file.
+        result = io.read
+        File.open(file_name, "w") do |file|
+          file.write(result)
+        end
+      end
+    end
+  end
+end
+
+
+main(
+  COMMIT_MESSAGE_FILE_NAME,
+  COMMIT_SOURCE,
+  COMMIT_SHA1
+)

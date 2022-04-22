@@ -1,0 +1,341 @@
+#!/usr/bin/env ruby
+# coding: utf-8
+require "json"
+require "set"
+require "fileutils"
+
+class Committer
+  # @return [Hash<String => Object>]
+  def self.json
+    @__json ||= JSON.parse(
+      File.binread(File.join(File.dirname(File.realdirpath(__FILE__)), "..", "team.json"))
+    ).freeze
+  end
+
+  # @return [Array<Hash{String => String}>]
+  def self.all
+    @_all ||= self.json.each_with_index.reduce([]) do |acc, (data, index)|
+      # Skip anyone in the team file without a github ID.
+      if (data.key?("github"))
+        acc << new(data.dup.tap { |d| d.store("id", index) })
+      else
+        acc
+      end
+    end
+  end
+
+  # @param [Integer]
+  #
+  # @return [Hash{String => String}]
+  # @return [nil]
+  def self.find(id)
+    case id
+    when Integer
+      self.all[id]
+    else
+      nil
+    end
+  end
+
+  # @return [Integer]
+  def self.count
+    all.count
+  end
+
+  # @!attribute [r]
+  # @return [String]
+  attr_reader :email
+
+  # @!attribute [r]
+  # @return [Integer]
+  attr_reader :id
+
+  # @!attribute [r]
+  # @return [String]
+  attr_reader :name
+
+  # @!attribute [r]
+  # @return [String]
+  attr_reader :github
+
+  # @param [Hash{String => String}] data
+  def initialize(data)
+    @email = data.fetch("email")
+    @id = data.fetch("id")
+    @name = data.fetch("name")
+    @github = data.fetch("github")
+  end
+
+  # @return [String]
+  def git_trailer
+    "Co-authored-by: %s <%s>" % [self.name, self.email]
+  end
+end # Committer
+
+
+module Pair
+  # @return [Set<Integer>]
+  def self.selected
+    @selected ||= Set.new
+  end
+
+  # @param [Committer] committer
+  #
+  # @return [Boolean]
+  def self.selected?(committer)
+    self.selected.member?(committer)
+  end
+
+  # @return [Set]
+  def self.solo
+    self.selected.clear
+  end
+
+  # @return [Array<Committer>]
+  def self.add_pair_choices
+    Committer.all
+  end
+
+  # @return [Array<Committer>]
+  def self.remove_pair_choices
+    self.selected.to_a
+  end
+
+  # @return [true]
+  def self.show_status
+    names = selected.map do |committer|
+      "\e[1m\e[32m#{committer.name}\e[22m\e[0m"
+    end
+
+    case names.count
+    when 0
+      puts "Looks like you're soloing."
+    when 1
+      puts "You are paired with %s. Cool." % [names.first]
+    when 2
+      puts "You are currently in cahoots with %s." % names.join(" and ")
+    else
+      puts "You are currently in a mob with %s, and %s." % [*names[0...-1].join(", "), names.last]
+    end
+
+    true
+  end
+
+  # Display a numbered list of choices.
+  #
+  # @param [Array<Object>] choices
+  #
+  # @return [nil]
+  def self.show_choices(choices, &block)
+    number_padding = choices.count.to_s.length
+
+    choices.each_with_index do |choice, choice_id|
+      print "[%#{number_padding}d]" % choice_id
+      print " "
+
+      if self.selected?(choice)
+        print "\e[1m"
+        print "\e[32m"
+        print block.call(choice)
+      else
+        print block.call(choice)
+      end
+
+      print "\e[22m"
+      print "\e[0m"
+      puts
+    end
+
+    nil
+  end
+
+  # Menu for adding pairs.
+  #
+  # @return [Boolean]
+  def self.interactive_add_pair
+    puts "Available pairs:"
+
+    show_choices(add_pair_choices) do |committer|
+      committer.name
+    end
+
+    print "> "
+
+    choice_id = gets.chomp
+
+    case choice_id
+    when /\A\d+\z/
+      maybe_committer = self.add_pair_choices[choice_id.to_i]
+
+      if maybe_committer
+        selected.add(maybe_committer)
+
+        true
+      else
+        puts "Hmm..."
+
+        false
+      end
+    end
+  end
+
+  # Menu for removing pairs.
+  #
+  # @return [Boolean]
+  def self.interactive_remove_pair
+    puts "Current pairs:"
+
+    show_choices(remove_pair_choices) do |committer|
+      committer.name
+    end
+
+    print "> "
+
+    choice_id = gets.chomp
+
+    case choice_id
+    when /\A\d+\z/
+      maybe_committer = self.remove_pair_choices[choice_id.to_i]
+
+      if maybe_committer
+        selected.delete(maybe_committer)
+
+        true
+      else
+        puts "Hmm..."
+
+        false
+      end
+    end
+  end
+
+  # The main menu.
+  #
+  # @return [nil]
+  def self.interactive_add_or_remove_pairs
+    loop do
+      show_status
+
+      puts "You can:"
+
+      choices = {
+        "Add a pair" => method(:interactive_add_pair),
+        "Remove a pair" => method(:interactive_remove_pair),
+        "Solo" => method(:solo)
+      }
+
+      show_choices(choices.keys) do |key|
+        key
+      end
+
+      puts "[q] Quit"
+
+      print "> "
+
+      answer = gets.chomp
+
+      case answer
+      when /\Aq(?:uit)?\z/
+        break
+      when /\A\d+\z/
+        key = choices.keys[answer.to_i]
+        key && choices[key].call
+      end
+    end
+
+    nil
+  end
+
+  # This is where pairing trailers are written.
+  PAIR_FILE = File.join(
+    ENV["HOME"], ".pair-state.json"
+  ).freeze
+
+  # Persists current pair state to disk.
+  #
+  # @return [nil]
+  def self.save!
+    File.open(PAIR_FILE, "w") do |file|
+      file.puts(
+        {
+          co_authors: selected.map(&:git_trailer).sort,
+          pair_names: selected.map(&:name).sort
+        }.to_json
+      )
+    end
+
+    nil
+  end
+
+  # Loads persisted pair state if it exists.
+  #
+  # @return [nil]
+  def self.load!
+    if File.exists?(PAIR_FILE)
+      data = JSON.parse(File.binread(PAIR_FILE))
+
+      case data
+      when Hash
+        co_authors = data["co_authors"]
+        case co_authors
+        when Array
+          selected.clear
+          Committer.all.each do |committer|
+            if co_authors.include?(committer.git_trailer)
+              selected.add(committer)
+            end
+          end
+        end
+      end
+    end
+
+    nil
+  end
+
+  # The `pair install` command implementation. Does the following:
+  # 
+  # 1. checks for .git repo presence
+  # 2. checks for .git/hooks/prepare-commit-msg
+  # 3. if .git/hooks/prepare-commit-msg exists, informs the user and exits.
+  # 4. if .git/hooks/prepare-commit-msg does not exist, copies
+  #    pair_prepare_commit_msg to .git/hooks/prepare-commit-msg and makes it
+  #    executable.
+  # 
+  # @return [nil]
+  def self.install_hook!
+    if Dir.exists?(".git")
+      hook_dir = ".git/hooks"
+      hook_file_path = "#{hook_dir}/prepare-commit-msg"
+      pair_prepare_commit_msg_path = File.join(File.dirname(File.realdirpath(__FILE__)), "pair_prepare_commit_msg")
+
+      if File.exists?(hook_file_path)
+        $stderr.puts("A prepare-commit-msg hook already exists in the current git repository.")
+        exit 1
+      else
+        FileUtils.mkdir_p(hook_dir)
+        $stdout.puts("cp #{pair_prepare_commit_msg_path} -> #{hook_file_path}")
+        FileUtils.copy(pair_prepare_commit_msg_path, hook_file_path)
+        $stdout.puts("chmod +x #{hook_file_path}")
+        FileUtils.chmod("u=wrx", hook_file_path)
+        $stdout.puts("Done!")
+      end
+    else
+      $stderr.puts("`pair install` can only be executed in the root of a git repository.")
+      exit 1
+    end
+  end
+
+  # @return [nil]
+  def self.main
+    if ARGV[0] == "install"
+      self.install_hook!
+    else
+      self.load!
+      self.interactive_add_or_remove_pairs
+      self.save!
+    end
+
+    nil
+  end
+end # Pair
+Pair.main
